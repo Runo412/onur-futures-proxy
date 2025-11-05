@@ -1,9 +1,12 @@
 {
   "name": "onur-futures-proxy",
   "version": "1.0.0",
+  "description": "Binance SPOT & FUTURES proxy for restricted regions",
   "main": "index.js",
   "type": "module",
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "express": "^4.18.2",
     "node-fetch": "^3.3.2"
