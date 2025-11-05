@@ -3,26 +3,21 @@ import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
-
-// ---- Tunables
 const TIMEOUT_MS = 12000;
 
-// Prefer Google-Cloud fronted spot host first
 const SPOT_HOSTS = [
   "https://api-gcp.binance.com",
   "https://api1.binance.com",
   "https://api.binance.com",
-  "https://data-api.binance.vision"  // public mirror (read-only, rate limit farklı)
+  "https://data-api.binance.vision"
 ];
 
-// Futures public endpoints (çoğu bölgede geoblock olabilir)
 const FUTURES_HOSTS = [
   "https://fapi.binance.com",
   "https://fapi1.binance.com",
   "https://fapi2.binance.com"
 ];
 
-// ---- Helpers
 async function fetchWithTimeout(url, init = {}) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -33,8 +28,8 @@ async function fetchWithTimeout(url, init = {}) {
       headers: {
         "user-agent":
           "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        "accept": "*/*",
-        "origin": "https://www.binance.com",
+        accept: "*/*",
+        origin: "https://www.binance.com",
         ...(init.headers || {})
       }
     });
@@ -47,20 +42,13 @@ async function fetchWithTimeout(url, init = {}) {
 async function tryHosts(hosts, path, method = "GET", body = null) {
   let last = { status: 0, text: "", host: "" };
   for (const base of hosts) {
-    const url = base + path;
+    const url = base + path; // path'i artık aynen geçiyoruz ( /api/... , /fapi/... )
     try {
-      const res = await fetchWithTimeout(url, {
-        method,
-        body
-      });
+      const res = await fetchWithTimeout(url, { method, body });
       const text = await res.text();
       if (res.ok) {
-        // JSON ise parse etmeye çalış, değilse metni döndür
-        try {
-          return { ok: true, host: base, json: JSON.parse(text) };
-        } catch (_) {
-          return { ok: true, host: base, text };
-        }
+        try { return { ok: true, host: base, json: JSON.parse(text) }; }
+        catch { return { ok: true, host: base, text }; }
       }
       last = { status: res.status, text, host: base };
     } catch (e) {
@@ -70,58 +58,39 @@ async function tryHosts(hosts, path, method = "GET", body = null) {
   return { ok: false, ...last };
 }
 
-// ---- Routes
-app.get("/", (_req, res) => {
-  res.json({ ok: true, ts: Date.now() });
-});
+// Health
+app.get("/", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// Show which host is used (simple health check)
+// Which host?
 app.get("/which", async (_req, res) => {
   const r = await tryHosts(SPOT_HOSTS, "/api/v3/time");
-  res.json(r.ok ? { ok: true, host: r.host, serverTime: r.json?.serverTime } :
-                  { ok: false, error: r.text, host: r.host, status: r.status });
+  res.json(r.ok ? { ok: true, host: r.host, serverTime: r.json?.serverTime }
+                : { ok: false, error: r.text, host: r.host, status: r.status });
 });
 
-// Spot pass-through
+// Spot pass-through (yolu aynen gönder)
 app.use("/api", async (req, res) => {
-  const path = req.originalUrl.replace(/^\/api/, "") || "/v3/time";
+  const path = req.originalUrl; // /api/...
   const r = await tryHosts(SPOT_HOSTS, path, req.method);
-  if (r.ok) return res
-    .status(200)
-    .type("application/json")
-    .send(r.json ? JSON.stringify(r.json) : r.text);
-
-  return res
-    .status(r.status || 502)
-    .json({
-      ok: false,
-      where: "spot",
-      host: r.host,
-      status: r.status,
-      error: r.text?.slice(0, 400)
-    });
+  if (r.ok) return res.status(200).type("application/json")
+                    .send(r.json ? JSON.stringify(r.json) : r.text);
+  return res.status(r.status || 502).json({
+    ok: false, where: "spot", host: r.host, status: r.status,
+    error: r.text?.slice(0, 400)
+  });
 });
 
-// Futures pass-through
+// Futures pass-through (yolu aynen gönder)
 app.use("/fapi", async (req, res) => {
-  const path = req.originalUrl.replace(/^\/fapi/, "") || "/v1/time";
+  const path = req.originalUrl; // /fapi/...
   const r = await tryHosts(FUTURES_HOSTS, path, req.method);
-  if (r.ok) return res
-    .status(200)
-    .type("application/json")
-    .send(r.json ? JSON.stringify(r.json) : r.text);
-
-  return res
-    .status(r.status || 502)
-    .json({
-      ok: false,
-      where: "futures",
-      host: r.host,
-      status: r.status,
-      error: r.text?.slice(0, 400)
-    });
+  if (r.ok) return res.status(200).type("application/json")
+                    .send(r.json ? JSON.stringify(r.json) : r.text);
+  return res.status(r.status || 502).json({
+    ok: false, where: "futures", host: r.host, status: r.status,
+    error: r.text?.slice(0, 400)
+  });
 });
 
-// Start (Render sets PORT)
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log("proxy up on", PORT));
