@@ -1,96 +1,75 @@
-// index.js — Render proxy (Spot + Futures) w/ robust fallback & clear errors
+// index.js  (tamamini yapistir)
 import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
-const TIMEOUT_MS = 12000;
 
-const SPOT_HOSTS = [
-  "https://api-gcp.binance.com",
-  "https://api1.binance.com",
-  "https://api.binance.com",
-  "https://data-api.binance.vision"
-];
-
-const FUTURES_HOSTS = [
-  "https://fapi.binance.com",
-  "https://fapi1.binance.com",
-  "https://fapi2.binance.com"
-];
-
-async function fetchWithTimeout(url, init = {}) {
+// ortak fetch wrapper
+async function proxyFetch(targetBase, req, res, where) {
+  const url = `${targetBase}${req.originalUrl}`;
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), 12_000);
+
   try {
-    const res = await fetch(url, {
-      ...init,
-      signal: controller.signal,
+    const r = await fetch(url, {
+      method: req.method,
       headers: {
+        // Binance 403/451 azaltma
         "user-agent":
           "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
         accept: "*/*",
         origin: "https://www.binance.com",
-        ...(init.headers || {})
-      }
+        referer: "https://www.binance.com/",
+      },
+      signal: controller.signal,
     });
-    return res;
-  } finally {
-    clearTimeout(t);
-  }
-}
 
-async function tryHosts(hosts, path, method = "GET", body = null) {
-  let last = { status: 0, text: "", host: "" };
-  for (const base of hosts) {
-    const url = base + path; // path'i artık aynen geçiyoruz ( /api/... , /fapi/... )
+    const text = await r.text();
+    // JSON ise JSON ver; değilse text döndür ama status’ü koru
     try {
-      const res = await fetchWithTimeout(url, { method, body });
-      const text = await res.text();
-      if (res.ok) {
-        try { return { ok: true, host: base, json: JSON.parse(text) }; }
-        catch { return { ok: true, host: base, text }; }
+      const json = JSON.parse(text);
+      if (!r.ok) {
+        return res
+          .status(r.status)
+          .json({ ok: false, where, host: targetBase, status: r.status, ...json });
       }
-      last = { status: res.status, text, host: base };
-    } catch (e) {
-      last = { status: 0, text: String(e), host: base };
+      return res.status(r.status).json(json);
+    } catch {
+      return res
+        .status(r.status)
+        .send(text || `${r.status} ${r.statusText}`);
     }
+  } catch (err) {
+    return res
+      .status(502)
+      .json({ ok: false, where, host: targetBase, status: 502, error: String(err) });
+  } finally {
+    clearTimeout(timer);
   }
-  return { ok: false, ...last };
 }
 
-// Health
+// health
 app.get("/", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// Which host?
-app.get("/which", async (_req, res) => {
-  const r = await tryHosts(SPOT_HOSTS, "/api/v3/time");
-  res.json(r.ok ? { ok: true, host: r.host, serverTime: r.json?.serverTime }
-                : { ok: false, error: r.text, host: r.host, status: r.status });
-});
+// Hangi host?
+app.get("/which", (_req, res) =>
+  res.json({
+    spot: "https://api-gcp.binance.com",
+    futures: "https://fapi.binance.com",
+  })
+);
 
-// Spot pass-through (yolu aynen gönder)
+// SPOT proxy (Türkiye için en stabil host)
 app.use("/api", async (req, res) => {
-  const path = req.originalUrl; // /api/...
-  const r = await tryHosts(SPOT_HOSTS, path, req.method);
-  if (r.ok) return res.status(200).type("application/json")
-                    .send(r.json ? JSON.stringify(r.json) : r.text);
-  return res.status(r.status || 502).json({
-    ok: false, where: "spot", host: r.host, status: r.status,
-    error: r.text?.slice(0, 400)
-  });
+  const spotBase = "https://api-gcp.binance.com";
+  return proxyFetch(spotBase, req, res, "spot");
 });
 
-// Futures pass-through (yolu aynen gönder)
+// FUTURES proxy (TR’de 403 dönebilir)
 app.use("/fapi", async (req, res) => {
-  const path = req.originalUrl; // /fapi/...
-  const r = await tryHosts(FUTURES_HOSTS, path, req.method);
-  if (r.ok) return res.status(200).type("application/json")
-                    .send(r.json ? JSON.stringify(r.json) : r.text);
-  return res.status(r.status || 502).json({
-    ok: false, where: "futures", host: r.host, status: r.status,
-    error: r.text?.slice(0, 400)
-  });
+  const futBase = "https://fapi.binance.com";
+  return proxyFetch(futBase, req, res, "futures");
 });
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log("proxy up on", PORT));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Proxy up on :" + PORT));
