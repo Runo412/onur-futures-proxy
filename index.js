@@ -1,85 +1,127 @@
-// index.js  — Render proxy (Spot + Futures) with fallback hosts & CORS
+// index.js — Render proxy (Spot + Futures) w/ robust fallback & clear errors
 import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
 
-// ----- CORS (kolay test için açık) -----
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
+// ---- Tunables
+const TIMEOUT_MS = 12000;
 
-// ----- Upstream host listeleri (önce GCP) -----
+// Prefer Google-Cloud fronted spot host first
 const SPOT_HOSTS = [
   "https://api-gcp.binance.com",
-  "https://api.binance.com",
   "https://api1.binance.com",
-  "https://data-api.binance.vision" // son çare
+  "https://api.binance.com",
+  "https://data-api.binance.vision"  // public mirror (read-only, rate limit farklı)
 ];
 
-const FUT_HOSTS = [
+// Futures public endpoints (çoğu bölgede geoblock olabilir)
+const FUTURES_HOSTS = [
   "https://fapi.binance.com",
   "https://fapi1.binance.com",
-  "https://fapi2.binance.com",
-  "https://dapi.binance.com" // bazı bölgelerde çalışabiliyor
+  "https://fapi2.binance.com"
 ];
 
-// Render’ın health-check’i ve hızlı test için
-app.get("/", (_req, res) => {
-  res.type("text").send("onur-futures-proxy: OK");
-});
-
-// Genel forwarder
-async function forwardWithFallback(req, res, hosts) {
-  let lastErr = null;
-  const path = req.originalUrl; // /api/... veya /fapi/...
-  for (const host of hosts) {
-    const url = host + path;
-    try {
-      const upstream = await fetch(url, {
-        method: req.method,
-        headers: {
-          // Binance bazen user-agent/cf istemeyebilir; sade bir UA verelim
-          "User-Agent": "Mozilla/5.0",
-          "Content-Type": req.get("Content-Type") || "application/json",
-        },
-        // Sadece GET yaptığımız için body yok; gerekirse buraya eklenebilir
-      });
-
-      // 2xx ise direkt döndür
-      if (upstream.ok) {
-        // response headers’ı kopyalayalım (minimum)
-        res.status(upstream.status);
-        upstream.headers.forEach((v, k) => {
-          if (!["content-security-policy", "content-encoding"].includes(k.toLowerCase())) {
-            res.setHeader(k, v);
-          }
-        });
-        const buf = await upstream.buffer();
-        return res.send(buf);
+// ---- Helpers
+async function fetchWithTimeout(url, init = {}) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "accept": "*/*",
+        "origin": "https://www.binance.com",
+        ...(init.headers || {})
       }
-
-      // 403/451 gibi engellerde fallback’e devam edelim
-      lastErr = new Error(`HTTP ${upstream.status} @ ${url}`);
-    } catch (e) {
-      lastErr = e;
-    }
+    });
+    return res;
+  } finally {
+    clearTimeout(t);
   }
-  // Hepsi fail
-  res.status(502).json({ ok: false, error: "All upstreams failed", lastError: String(lastErr) });
 }
 
-// /api/*  → SPOT
-app.use("/api", (req, res) => forwardWithFallback(req, res, SPOT_HOSTS));
-// /fapi/* → FUTURES
-app.use("/fapi", (req, res) => forwardWithFallback(req, res, FUT_HOSTS));
+async function tryHosts(hosts, path, method = "GET", body = null) {
+  let last = { status: 0, text: "", host: "" };
+  for (const base of hosts) {
+    const url = base + path;
+    try {
+      const res = await fetchWithTimeout(url, {
+        method,
+        body
+      });
+      const text = await res.text();
+      if (res.ok) {
+        // JSON ise parse etmeye çalış, değilse metni döndür
+        try {
+          return { ok: true, host: base, json: JSON.parse(text) };
+        } catch (_) {
+          return { ok: true, host: base, text };
+        }
+      }
+      last = { status: res.status, text, host: base };
+    } catch (e) {
+      last = { status: 0, text: String(e), host: base };
+    }
+  }
+  return { ok: false, ...last };
+}
 
-// Sunucu
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log("Proxy running on port", PORT);
+// ---- Routes
+app.get("/", (_req, res) => {
+  res.json({ ok: true, ts: Date.now() });
 });
+
+// Show which host is used (simple health check)
+app.get("/which", async (_req, res) => {
+  const r = await tryHosts(SPOT_HOSTS, "/api/v3/time");
+  res.json(r.ok ? { ok: true, host: r.host, serverTime: r.json?.serverTime } :
+                  { ok: false, error: r.text, host: r.host, status: r.status });
+});
+
+// Spot pass-through
+app.use("/api", async (req, res) => {
+  const path = req.originalUrl.replace(/^\/api/, "") || "/v3/time";
+  const r = await tryHosts(SPOT_HOSTS, path, req.method);
+  if (r.ok) return res
+    .status(200)
+    .type("application/json")
+    .send(r.json ? JSON.stringify(r.json) : r.text);
+
+  return res
+    .status(r.status || 502)
+    .json({
+      ok: false,
+      where: "spot",
+      host: r.host,
+      status: r.status,
+      error: r.text?.slice(0, 400)
+    });
+});
+
+// Futures pass-through
+app.use("/fapi", async (req, res) => {
+  const path = req.originalUrl.replace(/^\/fapi/, "") || "/v1/time";
+  const r = await tryHosts(FUTURES_HOSTS, path, req.method);
+  if (r.ok) return res
+    .status(200)
+    .type("application/json")
+    .send(r.json ? JSON.stringify(r.json) : r.text);
+
+  return res
+    .status(r.status || 502)
+    .json({
+      ok: false,
+      where: "futures",
+      host: r.host,
+      status: r.status,
+      error: r.text?.slice(0, 400)
+    });
+});
+
+// Start (Render sets PORT)
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log("proxy up on", PORT));
