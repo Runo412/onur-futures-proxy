@@ -1,9 +1,11 @@
 // signal.js — GitHub Actions ile 2/5 dakikada bir tarar, sinyalleri TELEGRAM'a yollar.
-// + Order book "sıcaklık" (Heat) ve duvar analizi eklendi.
+// Özellikler: Kalın coin adı, renkli RSI, Heat/Wall (order book), Hacim Spike ⚡ etiketleri.
 //
 // Secrets: TELEGRAM_TOKEN, CHAT_ID
-// Variables (opsiyonel): SYMBOL_CAP, PCT_1M, PCT_5M, VOL_MULT_15, RSI_UP, RSI_DOWN, RSI_OB, RSI_OS,
-//                        HEAT, DEPTH_LIMIT, MAX_HEAT_LOOKUPS
+// Variables (opsiyonel):
+//   SYMBOL_CAP, PCT_1M, PCT_5M, VOL_MULT_15, RSI_UP, RSI_DOWN, RSI_OB, RSI_OS,
+//   HEAT, DEPTH_LIMIT, MAX_HEAT_LOOKUPS,
+//   VOL_BADGE1, VOL_BADGE2, VOL_BADGE3
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
@@ -18,13 +20,18 @@ const SYMBOL_CAP       = +(process.env.SYMBOL_CAP       || 150);   // max tarana
 const PCT_1M           = +(process.env.PCT_1M           || 0.10);  // 1 dak % eşiği (örn 0.10 = %0.10)
 const PCT_5M           = +(process.env.PCT_5M           || 0.30);  // 5 dak % eşiği
 const VOL_MULT_15      = +(process.env.VOL_MULT_15      || 1.2);   // son 1dk hacim > SMA15 * çarpan
-const RSI_UP           = +(process.env.RSI_UP           || 55);    // yükseliş sinyali için RSI alt eşiği
-const RSI_DOWN         = +(process.env.RSI_DOWN         || 45);    // düşüş sinyali için RSI üst eşiği
-const RSI_OB           = +(process.env.RSI_OB           || 70);    // aşırı alım eşiği
-const RSI_OS           = +(process.env.RSI_OS           || 30);    // aşırı satış eşiği
+const RSI_UP           = +(process.env.RSI_UP           || 55);    // yükseliş için RSI alt eşiği
+const RSI_DOWN         = +(process.env.RSI_DOWN         || 45);    // düşüş için RSI üst eşiği
+const RSI_OB           = +(process.env.RSI_OB           || 70);    // aşırı alım
+const RSI_OS           = +(process.env.RSI_OS           || 30);    // aşırı satış
 const HEAT_ENABLED     = +(process.env.HEAT             || 1);     // 1 = Heat hesapla (sadece hit çıkanlar için)
-const DEPTH_LIMIT      = +(process.env.DEPTH_LIMIT      || 50);    // /depth limit: 5/10/20/50/100/500
-const MAX_HEAT_LOOKUPS = +(process.env.MAX_HEAT_LOOKUPS || 25);    // tek turda max kaç coin için depth çekelim
+const DEPTH_LIMIT      = +(process.env.DEPTH_LIMIT      || 50);    // /depth: 5/10/20/50/100/500
+const MAX_HEAT_LOOKUPS = +(process.env.MAX_HEAT_LOOKUPS || 25);    // tek turda max kaç coin için depth
+// Hacim spike rozet eşikleri (SMA15 katı):
+const VOL_BADGE1       = +(process.env.VOL_BADGE1       || 2.0);   // ⚡
+const VOL_BADGE2       = +(process.env.VOL_BADGE2       || 3.5);   // ⚡⚡
+const VOL_BADGE3       = +(process.env.VOL_BADGE3       || 6.0);   // 🚀
+
 const TOP_N            = SYMBOL_CAP;
 
 const HOSTS = [
@@ -108,10 +115,47 @@ function rsiBadge(rsi) {
   return "";
 }
 
+// Hacim Spike Rozeti (SMA15 katı)
+function volBadge(vMult) {
+  if (!Number.isFinite(vMult) || vMult <= 0) return "";
+  if (vMult >= VOL_BADGE3) return ` 🚀x${fmt(vMult,2)}`;     // çok güçlü
+  if (vMult >= VOL_BADGE2) return ` ⚡⚡x${fmt(vMult,2)}`;    // güçlü
+  if (vMult >= VOL_BADGE1) return ` ⚡x${fmt(vMult,2)}`;     // orta
+  return "";
+}
+
+// RSI'ya göre renk
+function rsiColor(rsi) {
+  if (rsi == null) return "#cccccc";
+  if (rsi >= 70) return "#ff4444"; // kırmızı: aşırı alım
+  if (rsi <= 30) return "#33b5e5"; // mavi: aşırı satış
+  if (rsi >= 55) return "#00C851"; // yeşil
+  if (rsi <= 45) return "#ffbb33"; // turuncu
+  return "#ffffff"; // nötr
+}
+
+// Heat/Wall stringi
+function heatStr(h) {
+  if (!("heat" in h)) return "";
+  const sign = h.heat > 0 ? "+" : "";
+  const flame = h.heat > 15 ? "🔥" : (h.heat < -15 ? "🥶" : "🌡️");
+  const wall = (h.wallRatio && h.wallRatio >= 1.8)
+    ? ` | Wall:${h.wallSide}×${fmt(h.wallRatio,2)}@${fmt(h.wallPrice,6)}`
+    : "";
+  return ` | Heat:${sign}${fmt(h.heat,0)}${flame}${wall}`;
+}
+
+// Tek satır biçimi (kalın coin adı, fiyat monospace, RSI renkli, hacim/heat rozetleri)
+function formatLine(h) {
+  const rsiClr = rsiColor(h.rsi);
+  const vBadge = volBadge(h.vMult);
+  return `• <b>${h.sym}</b> <code>₮${fmt(h.price, 6)}</code>  `
+       + `<i>1m:${fmt(h.pct1, 2)}%  5m:${fmt(h.pct5, 2)}%</i> `
+       + `Vol:${fmt(h.vMult, 2)}×${vBadge} `
+       + `RSI:<b><font color="${rsiClr}">${fmt(h.rsi, 1)}</font></b>${h.badge}${heatStr(h)}`;
+}
+
 // ---- Order book "Heat" hesaplama ----
-// depth.bids / depth.asks: [ [price, qty], ... ] string olarak gelir.
-// Heat ~ yakın seviyelerdeki (mid'e yakın) miktar daha yüksek ağırlık alır.
-// Skor = 100 * (BidPressure - AskPressure) / (BidPressure + AskPressure)  ∈ [-100, +100]
 function computeHeatFromDepth(depth) {
   if (!depth || !depth.bids?.length || !depth.asks?.length) return null;
 
@@ -122,21 +166,19 @@ function computeHeatFromDepth(depth) {
   const eps = 1e-9;
   let bp = 0, ap = 0;
 
-  // Mesafeye göre ağırlık (mid'e yakın olan daha değerli)
   for (const [pS, qS] of depth.bids) {
     const p = Number(pS), q = Number(qS);
-    const dist = Math.max(mid - p, eps);      // mid'den ne kadar aşağıda?
+    const dist = Math.max(mid - p, eps);
     bp += q / dist;
   }
   for (const [pS, qS] of depth.asks) {
     const p = Number(pS), q = Number(qS);
-    const dist = Math.max(p - mid, eps);      // mid'den ne kadar yukarıda?
+    const dist = Math.max(p - mid, eps);
     ap += q / dist;
   }
 
   const heat = (bp + ap) > 0 ? 100 * (bp - ap) / (bp + ap) : 0;
 
-  // Duvar analizi: her iki tarafta en büyük tek seviye/ortalama oranı
   function wallInfo(levels) {
     const qtys = levels.map(x => Number(x[1]));
     const maxQty = Math.max(...qtys);
@@ -149,7 +191,6 @@ function computeHeatFromDepth(depth) {
 
   const bidWall = wallInfo(depth.bids);
   const askWall = wallInfo(depth.asks);
-  // En baskın duvarı seç
   let wallSide = "Bid", wall = bidWall;
   if (askWall.ratio > bidWall.ratio) { wallSide = "Ask"; wall = askWall; }
 
@@ -211,7 +252,7 @@ async function getDepth(symbol, limit = 50) {
     }
   }
 
-  // ---- Heat sadece sınırlı sayıda (rate dostu) ----
+  // Heat/Wall sadece sınırlı sayıda (rate limit dostu)
   if (HEAT_ENABLED && hits.length) {
     const forHeat = hits.slice(0, Math.min(MAX_HEAT_LOOKUPS, hits.length));
     await Promise.all(
@@ -225,9 +266,7 @@ async function getDepth(symbol, limit = 50) {
             h.wallPrice = info.wallPrice;
             h.wallRatio = info.wallRatio;
           }
-        } catch (e) {
-          // sessiz geç
-        }
+        } catch (_) { /* sessiz geç */ }
       })
     );
   }
@@ -237,22 +276,11 @@ async function getDepth(symbol, limit = 50) {
   const neutralOB  = hits.filter(h => h.dir === "NEUTRAL" && h.rsi >= RSI_OB);
   const neutralOS  = hits.filter(h => h.dir === "NEUTRAL" && h.rsi <= RSI_OS);
 
-  function heatStr(h) {
-    if (!("heat" in h)) return "";
-    const sign = h.heat > 0 ? "+" : "";
-    const flame = h.heat > 15 ? "🔥" : (h.heat < -15 ? "🥶" : "🌡️");
-    const wall = (h.wallRatio && h.wallRatio >= 1.8)
-      ? ` | Wall:${h.wallSide}×${fmt(h.wallRatio,2)}@${fmt(h.wallPrice,6)}`
-      : "";
-    return ` | Heat:${sign}${fmt(h.heat,0)}${flame}${wall}`;
-    // Örn: " | Heat:+34🔥 | Wall:Bid×2.1@0.123400"
-  }
-
   if (upList.length) {
     const lines = upList
       .sort((a,b)=>b.pct1 - a.pct1)
       .slice(0, 20)
-      .map(h => `• <code>${h.sym}</code>  ₮${fmt(h.price, 6)}  1m:${fmt(h.pct1,2)}%  5m:${fmt(h.pct5,2)}%  Vol:${fmt(h.vMult,2)}×  RSI:${fmt(h.rsi,1)}${h.badge}${heatStr(h)}`);
+      .map(formatLine);
     await sendTelegram(`📈 <b>YÜKSELİŞ</b>\n${lines.join("\n")}`);
   }
 
@@ -260,7 +288,7 @@ async function getDepth(symbol, limit = 50) {
     const lines = downList
       .sort((a,b)=>a.pct1 - b.pct1)
       .slice(0, 20)
-      .map(h => `• <code>${h.sym}</code>  ₮${fmt(h.price, 6)}  1m:${fmt(h.pct1,2)}%  5m:${fmt(h.pct5,2)}%  Vol:${fmt(h.vMult,2)}×  RSI:${fmt(h.rsi,1)}${h.badge}${heatStr(h)}`);
+      .map(formatLine);
     await sendTelegram(`📉 <b>DÜŞÜŞ</b>\n${lines.join("\n")}`);
   }
 
@@ -268,7 +296,7 @@ async function getDepth(symbol, limit = 50) {
     const lines = neutralOB
       .sort((a,b)=>b.rsi - a.rsi)
       .slice(0, 15)
-      .map(h => `• <code>${h.sym}</code>  ₮${fmt(h.price, 6)}  RSI:${fmt(h.rsi,1)}  1m:${fmt(h.pct1,2)}%  5m:${fmt(h.pct5,2)}%  Vol:${fmt(h.vMult,2)}×${heatStr(h)}  ⚠️ Olası kar realizasyonu`);
+      .map(formatLine);
     await sendTelegram(`🟧 <b>RSI AŞIRI ALIM (>${RSI_OB})</b>\n${lines.join("\n")}`);
   }
 
@@ -276,7 +304,7 @@ async function getDepth(symbol, limit = 50) {
     const lines = neutralOS
       .sort((a,b)=>a.rsi - b.rsi)
       .slice(0, 15)
-      .map(h => `• <code>${h.sym}</code>  ₮${fmt(h.price, 6)}  RSI:${fmt(h.rsi,1)}  1m:${fmt(h.pct1,2)}%  5m:${fmt(h.pct5,2)}%  Vol:${fmt(h.vMult,2)}×${heatStr(h)}  💫 Olası tepki yükselişi`);
+      .map(formatLine);
     await sendTelegram(`🟦 <b>RSI AŞIRI SATIŞ (<${RSI_OS})</b>\n${lines.join("\n")}`);
   }
 
@@ -286,6 +314,7 @@ async function getDepth(symbol, limit = 50) {
       `🫥 <b>0 hit</b> • Tarandı: ${usdt.length}`
       + ` • Eşikler: 1m≥${PCT_1M}%  5m≥${PCT_5M}%  Vol≥${VOL_MULT_15}×`
       + `  RSI↑≥${RSI_UP}/RSI↓≤${RSI_DOWN}  OB>${RSI_OB}/OS<${RSI_OS}`
+      + ` • HacimRozet: ⚡≥${VOL_BADGE1}×, ⚡⚡≥${VOL_BADGE2}×, 🚀≥${VOL_BADGE3}×`
       + (HEAT_ENABLED ? ` • Heat: on (limit:${DEPTH_LIMIT}, max:${MAX_HEAT_LOOKUPS})` : "")
     );
   } else {
@@ -294,6 +323,7 @@ async function getDepth(symbol, limit = 50) {
       + ` • (↑:${upList.length} ↓:${downList.length} OB:${neutralOB.length} OS:${neutralOS.length})`
       + ` • Eşikler: 1m≥${PCT_1M}%  5m≥${PCT_5M}%  Vol≥${VOL_MULT_15}×`
       + `  RSI↑≥${RSI_UP}/RSI↓≤${RSI_DOWN}  OB>${RSI_OB}/OS<${RSI_OS}`
+      + ` • HacimRozet: ⚡≥${VOL_BADGE1}×, ⚡⚡≥${VOL_BADGE2}×, 🚀≥${VOL_BADGE3}×`
       + (HEAT_ENABLED ? ` • Heat: on (limit:${DEPTH_LIMIT}, max:${MAX_HEAT_LOOKUPS})` : "")
     );
   }
