@@ -1,7 +1,6 @@
-// signal.js — GitHub Actions ile 5 dakikada bir çalışır, sinyalleri TELEGRAM'a gönderir.
-// Node 20+ gerekir (Actions'ta biz ayarlıyoruz).
+// signal.js — GitHub Actions ile 2/5 dk'da bir tarar, sinyalleri TELEGRAM'a yollar.
 // Ortam değişkenleri (Secrets): TELEGRAM_TOKEN, CHAT_ID
-// Opsiyonel: SYMBOL_CAP, PCT_1M, PCT_5M, VOL_MULT_15, RSI_UP, RSI_DOWN
+// Opsiyonel Variables: SYMBOL_CAP, PCT_1M, PCT_5M, VOL_MULT_15, RSI_UP, RSI_DOWN, RSI_OB, RSI_OS
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
@@ -11,13 +10,15 @@ if (!TELEGRAM_TOKEN || !CHAT_ID) {
   process.exit(1);
 }
 
-// ---- Parametreler (istersen repo Settings→Actions→Variables ile override et) ----
-const SYMBOL_CAP   = +(process.env.SYMBOL_CAP   || 150);   // max kaç USDT çifti
-const PCT_1M       = +(process.env.PCT_1M       || 0.10);  // 1 dak % eşik (örn 0.10 = %0.10)
-const PCT_5M       = +(process.env.PCT_5M       || 0.30);  // 5 dak % eşik
+// ---- Parametreler (repo Settings → Actions → Variables ile override edebilirsin) ----
+const SYMBOL_CAP   = +(process.env.SYMBOL_CAP   || 150);   // max taranacak USDT çifti
+const PCT_1M       = +(process.env.PCT_1M       || 0.10);  // 1 dak % eşiği (örn 0.10 = %0.10)
+const PCT_5M       = +(process.env.PCT_5M       || 0.30);  // 5 dak % eşiği
 const VOL_MULT_15  = +(process.env.VOL_MULT_15  || 1.2);   // son 1dk hacim > SMA15 * çarpan
 const RSI_UP       = +(process.env.RSI_UP       || 55);    // yükseliş sinyali için RSI alt eşiği
 const RSI_DOWN     = +(process.env.RSI_DOWN     || 45);    // düşüş sinyali için RSI üst eşiği
+const RSI_OB       = +(process.env.RSI_OB       || 70);    // aşırı alım eşiği
+const RSI_OS       = +(process.env.RSI_OS       || 30);    // aşırı satış eşiği
 const TOP_N        = SYMBOL_CAP;
 
 const HOSTS = [
@@ -42,23 +43,21 @@ async function getJsonAny(path, params = "") {
 }
 
 function rsi14(closes) {
-  // Wilder RSI(14)
   if (closes.length < 15) return null;
   let gains = 0, losses = 0;
   for (let i = 1; i < 15; i++) {
-    const diff = closes[i] - closes[i-1];
-    if (diff >= 0) gains += diff; else losses -= diff;
+    const d = closes[i] - closes[i-1];
+    if (d >= 0) gains += d; else losses -= d;
   }
   gains /= 14; losses /= 14;
   let rs = losses === 0 ? 100 : gains / losses;
   let rsi = 100 - (100 / (1 + rs));
-  // smooth
   for (let i = 15; i < closes.length; i++) {
-    const diff = closes[i] - closes[i-1];
-    const gain = diff > 0 ? diff : 0;
-    const loss = diff < 0 ? -diff : 0;
-    gains = (gains * 13 + gain) / 14;
-    losses = (losses * 13 + loss) / 14;
+    const d = closes[i] - closes[i-1];
+    const g = d > 0 ? d : 0;
+    const l = d < 0 ? -d : 0;
+    gains = (gains * 13 + g) / 14;
+    losses = (losses * 13 + l) / 14;
     rs = losses === 0 ? 100 : gains / losses;
     rsi = 100 - (100 / (1 + rs));
   }
@@ -93,7 +92,15 @@ async function sendTelegram(text) {
 
 function fmt(n, d=4) {
   const f = Number(n);
-  return isFinite(f) ? f.toFixed(d) : String(n);
+  return Number.isFinite(f) ? f.toFixed(d) : String(n);
+}
+
+// Ek etiketler (aşırı alım/satış)
+function rsiBadge(rsi) {
+  if (rsi == null) return "";
+  if (rsi >= RSI_OB) return " ⚠️<b>Aşırı Alım</b>";
+  if (rsi <= RSI_OS) return " 💫<b>Aşırı Satış</b>";
+  return "";
 }
 
 (async () => {
@@ -126,36 +133,38 @@ function fmt(n, d=4) {
 
     const rsi = rsi14(closes);
 
-    // filtre
+    // Temel filtreler
     const up   = (pct1 >= PCT_1M || pct5 >= PCT_5M) && vMult >= VOL_MULT_15 && rsi !== null && rsi >= RSI_UP;
     const down = (pct1 <= -PCT_1M || pct5 <= -PCT_5M) && vMult >= VOL_MULT_15 && rsi !== null && rsi <= RSI_DOWN;
 
-    if (up || down) {
+    // İyileştirme: aşırı alım/satış etiketi
+    const badge = rsiBadge(rsi);
+
+    if (up || down || badge) {
       hits.push({
         sym,
         price: lastClose,
         pct1, pct5,
         vMult,
         rsi,
-        dir: up ? "UP" : "DOWN"
+        dir: up ? "UP" : (down ? "DOWN" : "NEUTRAL"),
+        badge
       });
     }
   }
 
-  if (hits.length === 0) {
-    await sendTelegram(`🫥 <b>0 hit</b> • Tarandı: ${usdt.length} sembol • Eşikler: 1m≥${PCT_1M}%  5m≥${PCT_5M}%  Vol≥${VOL_MULT_15}×  RSI↑≥${RSI_UP}/RSI↓≤${RSI_DOWN}`);
-    return;
-  }
+  // Ayrıştır
+  const upList     = hits.filter(h => h.dir === "UP");
+  const downList   = hits.filter(h => h.dir === "DOWN");
+  const neutralOB  = hits.filter(h => h.dir === "NEUTRAL" && h.rsi >= RSI_OB); // RSI yüksek ama up koşulu yok
+  const neutralOS  = hits.filter(h => h.dir === "NEUTRAL" && h.rsi <= RSI_OS); // RSI düşük ama down koşulu yok
 
-  // Gruplayıp gönder
-  const upList   = hits.filter(h => h.dir === "UP");
-  const downList = hits.filter(h => h.dir === "DOWN");
-
+  // Mesajlar
   if (upList.length) {
     const lines = upList
       .sort((a,b)=>b.pct1 - a.pct1)
       .slice(0, 20)
-      .map(h => `• <code>${h.sym}</code>  ₮${fmt(h.price, 6)}  1m:${fmt(h.pct1,2)}%  5m:${fmt(h.pct5,2)}%  Vol:${fmt(h.vMult,2)}×  RSI:${fmt(h.rsi,1)}`);
+      .map(h => `• <code>${h.sym}</code>  ₮${fmt(h.price, 6)}  1m:${fmt(h.pct1,2)}%  5m:${fmt(h.pct5,2)}%  Vol:${fmt(h.vMult,2)}×  RSI:${fmt(h.rsi,1)}${h.badge}`);
     await sendTelegram(`📈 <b>YÜKSELİŞ</b>\n${lines.join("\n")}`);
   }
 
@@ -163,11 +172,34 @@ function fmt(n, d=4) {
     const lines = downList
       .sort((a,b)=>a.pct1 - b.pct1)
       .slice(0, 20)
-      .map(h => `• <code>${h.sym}</code>  ₮${fmt(h.price, 6)}  1m:${fmt(h.pct1,2)}%  5m:${fmt(h.pct5,2)}%  Vol:${fmt(h.vMult,2)}×  RSI:${fmt(h.rsi,1)}`);
+      .map(h => `• <code>${h.sym}</code>  ₮${fmt(h.price, 6)}  1m:${fmt(h.pct1,2)}%  5m:${fmt(h.pct5,2)}%  Vol:${fmt(h.vMult,2)}×  RSI:${fmt(h.rsi,1)}${h.badge}`);
     await sendTelegram(`📉 <b>DÜŞÜŞ</b>\n${lines.join("\n")}`);
   }
 
-  await sendTelegram(`✅ Özet • Tarandı: ${usdt.length} • Hit: ${hits.length} • Eşikler: 1m≥${PCT_1M}%  5m≥${PCT_5M}%  Vol≥${VOL_MULT_15}×  RSI↑≥${RSI_UP}/RSI↓≤${RSI_DOWN}`);
+  // Yalnızca aşırı alım/satış (yön koşulları sağlanmadı ama RSI uçta)
+  if (neutralOB.length) {
+    const lines = neutralOB
+      .sort((a,b)=>b.rsi - a.rsi)
+      .slice(0, 15)
+      .map(h => `• <code>${h.sym}</code>  ₮${fmt(h.price, 6)}  RSI:${fmt(h.rsi,1)}  1m:${fmt(h.pct1,2)}%  5m:${fmt(h.pct5,2)}%  Vol:${fmt(h.vMult,2)}×  ⚠️ Olası kar realizasyonu`);
+    await sendTelegram(`🟧 <b>RSI AŞIRI ALIM (>${RSI_OB})</b>\n${lines.join("\n")}`);
+  }
+
+  if (neutralOS.length) {
+    const lines = neutralOS
+      .sort((a,b)=>a.rsi - b.rsi)
+      .slice(0, 15)
+      .map(h => `• <code>${h.sym}</code>  ₮${fmt(h.price, 6)}  RSI:${fmt(h.rsi,1)}  1m:${fmt(h.pct1,2)}%  5m:${fmt(h.pct5,2)}%  Vol:${fmt(h.vMult,2)}×  💫 Olası tepki yükselişi`);
+    await sendTelegram(`🟦 <b>RSI AŞIRI SATIŞ (<${RSI_OS})</b>\n${lines.join("\n")}`);
+  }
+
+  // Özet
+  const totalHits = upList.length + downList.length + neutralOB.length + neutralOS.length;
+  if (totalHits === 0) {
+    await sendTelegram(`🫥 <b>0 hit</b> • Tarandı: ${usdt.length} • Eşikler: 1m≥${PCT_1M}%  5m≥${PCT_5M}%  Vol≥${VOL_MULT_15}×  RSI↑≥${RSI_UP}/RSI↓≤${RSI_DOWN}  OB>${RSI_OB}/OS<${RSI_OS}`);
+  } else {
+    await sendTelegram(`✅ Özet • Tarandı: ${usdt.length} • Hit: ${totalHits} • (↑:${upList.length} ↓:${downList.length} OB:${neutralOB.length} OS:${neutralOS.length}) • Eşikler: 1m≥${PCT_1M}%  5m≥${PCT_5M}%  Vol≥${VOL_MULT_15}×  RSI↑≥${RSI_UP}/RSI↓≤${RSI_DOWN}  OB>${RSI_OB}/OS<${RSI_OS}`);
+  }
 })().catch(async (e) => {
   console.error(e);
   await sendTelegram(`⚠️ Hata: <code>${(e && e.message) || e}</code>`);
