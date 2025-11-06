@@ -2,7 +2,7 @@ name: Signal Bot (5m)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # her 5 dakikada bir
+    - cron: "*/2 * * * *"   # her 5 dakikada bir
   workflow_dispatch:        # istersek Elle Çalıştır
 
 jobs:
