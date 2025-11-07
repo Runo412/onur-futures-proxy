@@ -2,14 +2,12 @@ name: Signal Bot (5m)
 
 on:
   schedule:
-    - cron: "*/2 * * * *"   # her 5 dakikada bir
-  workflow_dispatch:        # istersek Elle Çalıştır
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -17,20 +15,14 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-
-      - name: Install deps (none required)
-        run: echo "Using global fetch in Node 20; no deps."
+          node-version: "20"   # yerleşik fetch var
 
       - name: Run signal job
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          # aşağıdakileri istersen repo → Settings → Actions → Variables olarak koyup override edebilirsin
-          SYMBOL_CAP: ${{ vars.SYMBOL_CAP || 150 }}
-          PCT_1M: ${{ vars.PCT_1M || 0.10 }}
-          PCT_5M: ${{ vars.PCT_5M || 0.30 }}
-          VOL_MULT_15: ${{ vars.VOL_MULT_15 || 1.2 }}
-          RSI_UP: ${{ vars.RSI_UP || 55 }}
-          RSI_DOWN: ${{ vars.RSI_DOWN || 45 }}
+          # İstersen eşikleri burada override edebilirsin:
+          # PCT_1S: "0.05"
+          # VOL_MULT_15S: "1.2"
+          # NO_HIT_SUMMARY: "1"
         run: node signal.js
